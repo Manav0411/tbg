@@ -1,0 +1,24 @@
+# Python cache / bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+env/
+.venv/
+venv/
+
+# Local secrets
+.env
+
+# Streamlit
+.streamlit/
+
+# OS files
+.DS_Store
+
+# Generated app outputs
+images/
+*.md
+!README.md
