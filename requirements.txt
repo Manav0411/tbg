@@ -1,0 +1,10 @@
+pandas
+streamlit
+pydantic
+langgraph
+langchain-google-genai
+langchain-nvidia-ai-endpoints
+langchain-core
+python-dotenv
+google-genai
+requests
