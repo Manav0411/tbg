@@ -17,6 +17,7 @@ from langgraph.types import Send
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
 load_dotenv()
 
@@ -26,16 +27,6 @@ HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
 HF_TEXT_ENDPOINT = os.getenv("HF_TEXT_ENDPOINT")
 HF_IMAGE_ENDPOINT = os.getenv("HF_IMAGE_ENDPOINT")
 
-# ============================================================
-# Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
-# Patches image capability using your 3-node reducer flow:
-#   merge_content -> decide_images -> generate_and_place_images
-# ============================================================
-
-
-# -----------------------------
-# 1) Schemas
-# -----------------------------
 class Task(BaseModel):
     id: int
     title: str
@@ -61,7 +52,7 @@ class Plan(BaseModel):
 class EvidenceItem(BaseModel):
     title: str
     url: str
-    published_at: Optional[str] = None  # ISO "YYYY-MM-DD" preferred
+    published_at: Optional[str] = None
     snippet: Optional[str] = None
     source: Optional[str] = None
 
@@ -78,7 +69,6 @@ class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-# ---- Image planning schema (ported from your image flow) ----
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
     filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
@@ -95,27 +85,77 @@ class GlobalImagePlan(BaseModel):
 
 class State(TypedDict):
     topic: str
-
-    # routing / research
     mode: str
     needs_research: bool
     queries: List[str]
     evidence: List[EvidenceItem]
     plan: Optional[Plan]
-
-    # recency
     as_of: str
     recency_days: int
-
-    # workers
-    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
-
-    # reducer/image
+    sections: Annotated[List[tuple[int, str]], operator.add]
     merged_md: str
     md_with_placeholders: str
     image_specs: List[dict]
-
     final: str
+
+
+def _is_hf_quota_error(exc: Exception) -> bool:
+    if isinstance(exc, HfHubHTTPError) and getattr(exc.response, "status_code", None) == 402:
+        return True
+    text = str(exc).lower()
+    return "402" in text and (
+        "payment required" in text
+        or "depleted your monthly included credits" in text
+        or "subscribe to pro" in text
+    )
+
+
+def _fallback_router(topic: str) -> RouterDecision:
+    lowered = topic.lower()
+    needs_research = any(word in lowered for word in ["latest", "news", "today", "current", "pricing", "release", "launch"])
+    if any(word in lowered for word in ["news", "latest", "today", "current"]):
+        mode = "open_book"
+    elif needs_research:
+        mode = "hybrid"
+    else:
+        mode = "closed_book"
+    return RouterDecision(
+        needs_research=needs_research,
+        mode=mode,
+        reason="Fallback router used because Hugging Face credits are exhausted.",
+        queries=[topic] if needs_research else [],
+        max_results_per_query=5,
+    )
+
+
+def _fallback_plan(topic: str, mode: str) -> Plan:
+    blog_kind = "news_roundup" if mode == "open_book" else "explainer"
+    tasks = [
+        Task(id=1, title="Overview", goal="Introduce the topic and why it matters.", bullets=["Define the topic", "State practical value", "Preview the structure"], target_words=140),
+        Task(id=2, title="Core Concepts", goal="Explain the main concepts clearly.", bullets=["Explain key terms", "Show how parts connect", "Clarify common confusion"], target_words=170),
+        Task(id=3, title="How It Works", goal="Describe workflow or mechanism.", bullets=["Walk through the process", "Cover inputs and outputs", "Highlight constraints"], target_words=170),
+        Task(id=4, title="Practical Guidance", goal="Provide actionable recommendations.", bullets=["List best practices", "Call out pitfalls", "Offer a starter path"], target_words=150),
+        Task(id=5, title="Wrap-Up", goal="Summarize the core takeaways.", bullets=["Recap key points", "Share next steps", "Close with a recommendation"], target_words=120),
+    ]
+    return Plan(
+        blog_title=topic.strip() or "Blog Post",
+        audience="technical readers",
+        tone="clear and practical",
+        blog_kind=blog_kind,
+        constraints=["Generated using fallback mode because Hugging Face credits are exhausted."],
+        tasks=tasks,
+    )
+
+
+def _fallback_section(task: Task, plan: Plan, topic: str) -> str:
+    bullets = "\n".join(f"- {b}" for b in task.bullets)
+    return (
+        f"## {task.title}\n\n"
+        f"{task.goal}\n\n"
+        f"Topic focus: {topic}.\n\n"
+        f"{bullets}\n\n"
+        f"This section is in fallback mode due to temporary model-credit limits and keeps guidance practical for {plan.audience}.\n"
+    )
 
 
 def _hf_text_client() -> InferenceClient:
@@ -243,9 +283,6 @@ def _image_dimensions(size: str) -> tuple[int, int]:
     }.get(size, (1024, 1024))
 
 
-# -----------------------------
-# 3) Router
-# -----------------------------
 ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
 
 Decide whether web research is needed BEFORE planning.
@@ -261,13 +298,18 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decision = _hf_structured_output(
-        RouterDecision,
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
-        ],
-    )
+    try:
+        decision = _hf_structured_output(
+            RouterDecision,
+            [
+                SystemMessage(content=ROUTER_SYSTEM),
+                HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+            ],
+        )
+    except Exception as exc:
+        if not _is_hf_quota_error(exc):
+            raise
+        decision = _fallback_router(state["topic"])
 
     if decision.mode == "open_book":
         recency_days = 7
@@ -286,9 +328,6 @@ def router_node(state: State) -> dict:
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
 
-# -----------------------------
-# 4) Research (Tavily)
-# -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
     if not os.getenv("TAVILY_API_KEY"):
         return []
@@ -340,19 +379,24 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
-    pack = _hf_structured_output(
-        EvidencePack,
-        [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"As-of date: {state['as_of']}\n"
-                    f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
-                )
-            ),
-        ],
-    )
+    try:
+        pack = _hf_structured_output(
+            EvidencePack,
+            [
+                SystemMessage(content=RESEARCH_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"As-of date: {state['as_of']}\n"
+                        f"Recency days: {state['recency_days']}\n\n"
+                        f"Raw results:\n{raw}"
+                    )
+                ),
+            ],
+        )
+    except Exception as exc:
+        if not _is_hf_quota_error(exc):
+            raise
+        return {"evidence": []}
 
     dedup = {}
     for e in pack.evidence:
@@ -367,9 +411,6 @@ def research_node(state: State) -> dict:
 
     return {"evidence": evidence}
 
-# -----------------------------
-# 5) Orchestrator (Plan)
-# -----------------------------
 ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
@@ -394,30 +435,32 @@ def orchestrator_node(state: State) -> dict:
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = _hf_structured_output(
-        Plan,
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
-                )
-            ),
-        ],
-    )
+    try:
+        plan = _hf_structured_output(
+            Plan,
+            [
+                SystemMessage(content=ORCH_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Topic: {state['topic']}\n"
+                        f"Mode: {mode}\n"
+                        f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
+                        f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                        f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                    )
+                ),
+            ],
+        )
+    except Exception as exc:
+        if not _is_hf_quota_error(exc):
+            raise
+        plan = _fallback_plan(state["topic"], mode)
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
     return {"plan": plan}
 
 
-# -----------------------------
-# 6) Fanout
-# -----------------------------
 def fanout(state: State):
     assert state["plan"] is not None
     return [
@@ -436,9 +479,6 @@ def fanout(state: State):
         for task in state["plan"].tasks
     ]
 
-# -----------------------------
-# 7) Worker
-# -----------------------------
 WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
 Write ONE section of a technical blog post in Markdown.
 
@@ -472,41 +512,42 @@ def worker_node(payload: dict) -> dict:
         for e in evidence[:20]
     )
 
-    section_md = _hf_generate_text(
-        [
-            SystemMessage(content=WORKER_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog title: {plan.blog_title}\n"
-                    f"Audience: {plan.audience}\n"
-                    f"Tone: {plan.tone}\n"
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Constraints: {plan.constraints}\n"
-                    f"Topic: {payload['topic']}\n"
-                    f"Mode: {payload.get('mode')}\n"
-                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
-                    f"Section title: {task.title}\n"
-                    f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
-                    f"Tags: {task.tags}\n"
-                    f"requires_research: {task.requires_research}\n"
-                    f"requires_citations: {task.requires_citations}\n"
-                    f"requires_code: {task.requires_code}\n"
-                    f"Bullets:{bullets_text}\n\n"
-                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
-                )
-            ),
-        ],
-        max_new_tokens=max(512, int(task.target_words * 2.2)),
-        temperature=0.4,
-    )
+    try:
+        section_md = _hf_generate_text(
+            [
+                SystemMessage(content=WORKER_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Blog title: {plan.blog_title}\n"
+                        f"Audience: {plan.audience}\n"
+                        f"Tone: {plan.tone}\n"
+                        f"Blog kind: {plan.blog_kind}\n"
+                        f"Constraints: {plan.constraints}\n"
+                        f"Topic: {payload['topic']}\n"
+                        f"Mode: {payload.get('mode')}\n"
+                        f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
+                        f"Section title: {task.title}\n"
+                        f"Goal: {task.goal}\n"
+                        f"Target words: {task.target_words}\n"
+                        f"Tags: {task.tags}\n"
+                        f"requires_research: {task.requires_research}\n"
+                        f"requires_citations: {task.requires_citations}\n"
+                        f"requires_code: {task.requires_code}\n"
+                        f"Bullets:{bullets_text}\n\n"
+                        f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
+                    )
+                ),
+            ],
+            max_new_tokens=max(512, int(task.target_words * 2.2)),
+            temperature=0.4,
+        )
+    except Exception as exc:
+        if not _is_hf_quota_error(exc):
+            raise
+        section_md = _fallback_section(task, plan, payload["topic"])
 
     return {"sections": [(task.id, section_md)]}
 
-# ============================================================
-# 8) ReducerWithImages (subgraph)
-#    merge_content -> decide_images -> generate_and_place_images
-# ============================================================
 def merge_content(state: State) -> dict:
     plan = state["plan"]
     if plan is None:
@@ -534,20 +575,23 @@ def decide_images(state: State) -> dict:
     plan = state["plan"]
     assert plan is not None
 
-    image_plan = _hf_structured_output(
-        GlobalImagePlan,
-        [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
-                )
-            ),
-        ],
-    )
+    try:
+        image_plan = _hf_structured_output(
+            GlobalImagePlan,
+            [
+                SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+                HumanMessage(
+                    content=(
+                        f"Blog kind: {plan.blog_kind}\n"
+                        f"Topic: {state['topic']}\n\n"
+                        "Insert placeholders + propose image prompts.\n\n"
+                        f"{merged_md}"
+                    )
+                ),
+            ],
+        )
+    except Exception:
+        image_plan = GlobalImagePlan(md_with_placeholders=merged_md, images=[])
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -556,10 +600,6 @@ def decide_images(state: State) -> dict:
 
 
 def _hf_generate_image_bytes(prompt: str, *, width: int, height: int) -> bytes:
-    """
-    Returns raw image bytes generated by a Hugging Face image endpoint.
-    Env vars: HF_TOKEN, HF_IMAGE_ENDPOINT or HF_IMAGE_MODEL
-    """
     client = _hf_image_client()
     image = client.text_to_image(
         prompt=prompt,
@@ -588,7 +628,6 @@ def generate_and_place_images(state: State) -> dict:
     md = state.get("md_with_placeholders") or state["merged_md"]
     image_specs = state.get("image_specs", []) or []
 
-    # If no images requested, just write merged markdown
     if not image_specs:
         filename = f"{_safe_slug(plan.blog_title)}.md"
         Path(filename).write_text(md, encoding="utf-8")
@@ -603,13 +642,11 @@ def generate_and_place_images(state: State) -> dict:
         out_path = images_dir / filename
         width, height = _image_dimensions(spec.get("size", "1024x1024"))
 
-        # generate only if needed
         if not out_path.exists():
             try:
                 img_bytes = _hf_generate_image_bytes(spec["prompt"], width=width, height=height)
                 out_path.write_bytes(img_bytes)
             except Exception as e:
-                # graceful fallback: keep doc usable
                 prompt_block = (
                     f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
                     f"> **Alt:** {spec.get('alt','')}\n>\n"
@@ -626,7 +663,6 @@ def generate_and_place_images(state: State) -> dict:
     Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
 
-# build reducer subgraph
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
 reducer_graph.add_node("decide_images", decide_images)
@@ -637,9 +673,6 @@ reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
 
-# -----------------------------
-# 9) Build main graph
-# -----------------------------
 g = StateGraph(State)
 g.add_node("router", router_node)
 g.add_node("research", research_node)

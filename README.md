@@ -1,2 +1,2 @@
 # Blog Agent
-LLM-powered blog generation system
+LLM-powered blog generation agent
