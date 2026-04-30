@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import operator
 import os
 import re
@@ -12,20 +14,17 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
+from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from huggingface_hub import InferenceClient
 
-# Ensure environment variables from .env are loaded before LLM initialization
 load_dotenv()
 
-# -----------------------------
-# 2) LLM
-# -----------------------------
-llm = ChatNVIDIA(
-    model=os.environ.get("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct"),
-    api_key=os.environ.get("NVIDIA_API_KEY"),
-)
-from langchain_core.messages import SystemMessage, HumanMessage
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TEXT_MODEL = os.getenv("HF_TEXT_MODEL", "meta-llama/Llama-3.1-70B")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
+HF_TEXT_ENDPOINT = os.getenv("HF_TEXT_ENDPOINT")
+HF_IMAGE_ENDPOINT = os.getenv("HF_IMAGE_ENDPOINT")
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
@@ -119,64 +118,130 @@ class State(TypedDict):
     final: str
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    return "429" in text or "too many requests" in text or "rate limit" in text
+def _hf_text_client() -> InferenceClient:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not set.")
+    if HF_TEXT_ENDPOINT:
+        return InferenceClient(model=HF_TEXT_ENDPOINT, token=HF_TOKEN)
+    return InferenceClient(token=HF_TOKEN)
 
 
-def _fallback_router(topic: str) -> RouterDecision:
-    lowered = topic.lower()
-    needs_research = any(word in lowered for word in ["latest", "news", "today", "current", "pricing", "release", "launch"])
-    if any(word in lowered for word in ["news", "latest", "today", "current"]):
-        mode = "open_book"
-        queries = [topic]
-    elif needs_research:
-        mode = "hybrid"
-        queries = [topic]
-    else:
-        mode = "closed_book"
-        queries = []
-    return RouterDecision(
-        needs_research=needs_research,
-        mode=mode,
-        reason="Fallback router used because the NVIDIA API is rate-limited.",
-        queries=queries,
-        max_results_per_query=5,
+def _hf_image_client() -> InferenceClient:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not set.")
+    if HF_IMAGE_ENDPOINT:
+        return InferenceClient(model=HF_IMAGE_ENDPOINT, token=HF_TOKEN)
+    return InferenceClient(token=HF_TOKEN)
+
+
+def _messages_to_prompt(messages: list[object]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        role = message.__class__.__name__.replace("Message", "")
+        if role == "System":
+            label = "System"
+        elif role == "Human":
+            label = "User"
+        else:
+            label = role or "Message"
+        parts.append(f"{label}:\n{getattr(message, 'content', str(message))}")
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+def _hf_generate_text(messages: list[object], *, max_new_tokens: int = 1024, temperature: float = 0.2) -> str:
+    client = _hf_text_client()
+    chat_messages = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            role = "system"
+        else:
+            role = "user"
+        chat_messages.append({"role": role, "content": getattr(message, "content", str(message))})
+
+    completion = client.chat.completions.create(
+        model=HF_TEXT_MODEL,
+        messages=chat_messages,
+        max_tokens=max_new_tokens,
+        temperature=temperature,
+        stream=False,
     )
+    return completion.choices[0].message.content.strip()
 
 
-def _fallback_plan(topic: str, mode: str) -> Plan:
-    blog_kind = "news_roundup" if mode == "open_book" else "explainer"
-    tasks = [
-        Task(id=1, title="Overview", goal="Introduce the topic and why it matters.", bullets=["Define the topic", "State the practical value", "Preview the structure"], target_words=140),
-        Task(id=2, title="Core Concepts", goal="Explain the main ideas and terminology.", bullets=["Break down the key terms", "Explain how the pieces fit", "Call out common confusion points"], target_words=170),
-        Task(id=3, title="How It Works", goal="Describe the workflow or mechanics.", bullets=["Walk through the process", "Highlight inputs and outputs", "Mention any important constraints"], target_words=170),
-        Task(id=4, title="Practical Guidance", goal="Share usable guidance or next steps.", bullets=["List best practices", "Point out pitfalls", "Suggest a starting point"], target_words=150),
-        Task(id=5, title="Wrap-Up", goal="Summarize the takeaway and next steps.", bullets=["Summarize the main points", "Give a concluding recommendation", "Suggest what to do next"], target_words=120),
-    ]
-    return Plan(
-        blog_title=topic.strip() or "Blog Post",
-        audience="general technical readers",
-        tone="clear and practical",
-        blog_kind=blog_kind,
-        constraints=["Fallback content generated locally because the model is rate-limited."],
-        tasks=tasks,
-    )
+def _schema_response_format(model: type[BaseModel]) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": model.__name__,
+            "schema": model.model_json_schema(),
+            "strict": True,
+        },
+    }
 
 
-def _fallback_section(task: Task, plan: Plan, topic: str) -> str:
-    bullets = "\n".join(f"- {bullet}" for bullet in task.bullets)
-    return (
-        f"## {task.title}\n\n"
-        f"{task.goal}\n\n"
-        f"For {topic}, the main points are:\n{bullets}\n\n"
-        f"This section focuses on the practical shape of the topic for {plan.audience}.\n"
-    )
+def _parse_structured_payload(text: str) -> object:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+
+    for open_char, close_char in (("{", "}"), ("[", "]")):
+        start = stripped.find(open_char)
+        end = stripped.rfind(close_char)
+        if start != -1 and end != -1 and end > start:
+            candidate = stripped[start : end + 1].strip()
+            try:
+                json.loads(candidate)
+                return json.loads(candidate)
+            except Exception:
+                try:
+                    return ast.literal_eval(candidate)
+                except Exception:
+                    continue
+
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return ast.literal_eval(stripped)
 
 
-# -----------------------------
-# 2) LLM (configured above)
-# -----------------------------
+def _hf_structured_output(model: type[BaseModel], messages: list[object], *, max_new_tokens: int = 1536) -> BaseModel:
+    client = _hf_text_client()
+    chat_messages = []
+    for message in messages:
+        role = "system" if isinstance(message, SystemMessage) else "user"
+        chat_messages.append({"role": role, "content": getattr(message, "content", str(message))})
+
+    try:
+        completion = client.chat.completions.create(
+            model=HF_TEXT_MODEL,
+            messages=chat_messages,
+            max_tokens=max_new_tokens,
+            temperature=0.1,
+            response_format=_schema_response_format(model),
+            stream=False,
+        )
+        raw = completion.choices[0].message.content or ""
+    except Exception:
+        schema = json.dumps(model.model_json_schema(), indent=2, ensure_ascii=False)
+        structured_messages = messages + [
+            SystemMessage(content="Return only valid JSON. Do not use markdown code fences or any extra commentary."),
+            HumanMessage(content=f"Schema:\n{schema}"),
+        ]
+        raw = _hf_generate_text(structured_messages, max_new_tokens=max_new_tokens, temperature=0.1)
+
+    parsed = _parse_structured_payload(raw)
+    return model.model_validate(parsed)
+
+
+def _image_dimensions(size: str) -> tuple[int, int]:
+    return {
+        "1024x1024": (1024, 1024),
+        "1024x1536": (1024, 1536),
+        "1536x1024": (1536, 1024),
+    }.get(size, (1024, 1024))
+
 
 # -----------------------------
 # 3) Router
@@ -196,18 +261,13 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    try:
-        decision = decider.invoke(
-            [
-                SystemMessage(content=ROUTER_SYSTEM),
-                HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
-            ]
-        )
-    except Exception as exc:
-        if not _is_rate_limit_error(exc):
-            raise
-        decision = _fallback_router(state["topic"])
+    decision = _hf_structured_output(
+        RouterDecision,
+        [
+            SystemMessage(content=ROUTER_SYSTEM),
+            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+        ],
+    )
 
     if decision.mode == "open_book":
         recency_days = 7
@@ -280,8 +340,8 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
+    pack = _hf_structured_output(
+        EvidencePack,
         [
             SystemMessage(content=RESEARCH_SYSTEM),
             HumanMessage(
@@ -291,7 +351,7 @@ def research_node(state: State) -> dict:
                     f"Raw results:\n{raw}"
                 )
             ),
-        ]
+        ],
     )
 
     dedup = {}
@@ -329,33 +389,28 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    try:
-        plan = planner.invoke(
-            [
-                SystemMessage(content=ORCH_SYSTEM),
-                HumanMessage(
-                    content=(
-                        f"Topic: {state['topic']}\n"
-                        f"Mode: {mode}\n"
-                        f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                        f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                        f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
-                    )
-                ),
-            ]
-        )
-        if forced_kind:
-            plan.blog_kind = "news_roundup"
-    except Exception as exc:
-        if not _is_rate_limit_error(exc):
-            raise
-        plan = _fallback_plan(state["topic"], mode)
+    plan = _hf_structured_output(
+        Plan,
+        [
+            SystemMessage(content=ORCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {mode}\n"
+                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
+                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
+                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                )
+            ),
+        ],
+    )
+    if forced_kind:
+        plan.blog_kind = "news_roundup"
 
     return {"plan": plan}
 
@@ -417,37 +472,34 @@ def worker_node(payload: dict) -> dict:
         for e in evidence[:20]
     )
 
-    try:
-        section_md = llm.invoke(
-            [
-                SystemMessage(content=WORKER_SYSTEM),
-                HumanMessage(
-                    content=(
-                        f"Blog title: {plan.blog_title}\n"
-                        f"Audience: {plan.audience}\n"
-                        f"Tone: {plan.tone}\n"
-                        f"Blog kind: {plan.blog_kind}\n"
-                        f"Constraints: {plan.constraints}\n"
-                        f"Topic: {payload['topic']}\n"
-                        f"Mode: {payload.get('mode')}\n"
-                        f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
-                        f"Section title: {task.title}\n"
-                        f"Goal: {task.goal}\n"
-                        f"Target words: {task.target_words}\n"
-                        f"Tags: {task.tags}\n"
-                        f"requires_research: {task.requires_research}\n"
-                        f"requires_citations: {task.requires_citations}\n"
-                        f"requires_code: {task.requires_code}\n"
-                        f"Bullets:{bullets_text}\n\n"
-                        f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
-                    )
-                ),
-            ]
-        ).content.strip()
-    except Exception as exc:
-        if not _is_rate_limit_error(exc):
-            raise
-        section_md = _fallback_section(task, plan, payload["topic"])
+    section_md = _hf_generate_text(
+        [
+            SystemMessage(content=WORKER_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Tone: {plan.tone}\n"
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Constraints: {plan.constraints}\n"
+                    f"Topic: {payload['topic']}\n"
+                    f"Mode: {payload.get('mode')}\n"
+                    f"As-of: {payload.get('as_of')} (recency_days={payload.get('recency_days')})\n\n"
+                    f"Section title: {task.title}\n"
+                    f"Goal: {task.goal}\n"
+                    f"Target words: {task.target_words}\n"
+                    f"Tags: {task.tags}\n"
+                    f"requires_research: {task.requires_research}\n"
+                    f"requires_citations: {task.requires_citations}\n"
+                    f"requires_code: {task.requires_code}\n"
+                    f"Bullets:{bullets_text}\n\n"
+                    f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
+                )
+            ),
+        ],
+        max_new_tokens=max(512, int(task.target_words * 2.2)),
+        temperature=0.4,
+    )
 
     return {"sections": [(task.id, section_md)]}
 
@@ -478,29 +530,24 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
 
-    try:
-        image_plan = planner.invoke(
-            [
-                SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-                HumanMessage(
-                    content=(
-                        f"Blog kind: {plan.blog_kind}\n"
-                        f"Topic: {state['topic']}\n\n"
-                        "Insert placeholders + propose image prompts.\n\n"
-                        f"{merged_md}"
-                    )
-                ),
-            ]
-        )
-    except Exception as exc:
-        if not _is_rate_limit_error(exc):
-            raise
-        image_plan = GlobalImagePlan(md_with_placeholders=merged_md, images=[])
+    image_plan = _hf_structured_output(
+        GlobalImagePlan,
+        [
+            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Topic: {state['topic']}\n\n"
+                    "Insert placeholders + propose image prompts.\n\n"
+                    f"{merged_md}"
+                )
+            ),
+        ],
+    )
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -508,52 +555,23 @@ def decide_images(state: State) -> dict:
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
+def _hf_generate_image_bytes(prompt: str, *, width: int, height: int) -> bytes:
     """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
+    Returns raw image bytes generated by a Hugging Face image endpoint.
+    Env vars: HF_TOKEN, HF_IMAGE_ENDPOINT or HF_IMAGE_MODEL
     """
-    from google import genai
-    from google.genai import types
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="imagen-4-fast",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
+    client = _hf_image_client()
+    image = client.text_to_image(
+        prompt=prompt,
+        model=HF_IMAGE_MODEL,
+        width=width,
+        height=height,
     )
+    from io import BytesIO
 
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
-
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _safe_slug(title: str) -> str:
@@ -583,11 +601,12 @@ def generate_and_place_images(state: State) -> dict:
         placeholder = spec["placeholder"]
         filename = spec["filename"]
         out_path = images_dir / filename
+        width, height = _image_dimensions(spec.get("size", "1024x1024"))
 
         # generate only if needed
         if not out_path.exists():
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _hf_generate_image_bytes(spec["prompt"], width=width, height=height)
                 out_path.write_bytes(img_bytes)
             except Exception as e:
                 # graceful fallback: keep doc usable
